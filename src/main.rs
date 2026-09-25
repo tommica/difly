@@ -19,12 +19,12 @@ fn main() -> eframe::Result {
         println!("difly {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    let viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("Difly")
+        .with_inner_size([1400.0, 900.0])
+        .with_min_inner_size([900.0, 600.0]);
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Difly")
-            .with_icon(icon::window_icon())
-            .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([900.0, 600.0]),
+        viewport: icon::with_window_icon(viewport),
         ..Default::default()
     };
     eframe::run_native(

@@ -2,16 +2,27 @@
 
 A standalone Git commit dialog built in Rust with egui. Review and edit diffs, select hunks, commit or amend, and resolve merge conflicts.
 
-## Run
+![Difly showing an editable side-by-side Git diff](docs/images/difly.png)
 
-Requires Rust/Cargo and Git with an author configured.
+## Install and run
+
+With Homebrew (macOS/Linux):
 
 ```sh
-cargo run --release -- /path/to/repository
-# Or install the CLI:
-cargo install --path .
-difly                  # opens the current repository
+brew install tommica/tap/difly
+difly /path/to/repository        # omit the path for the current repository
 ```
+
+Update with `brew update && brew upgrade difly`.
+
+Or build from source with Rust/Cargo and Git:
+
+```sh
+cargo install --path .
+difly
+```
+
+Git needs an author configured before committing.
 
 Targets macOS, Linux, and Windows. Tested locally on macOS; CI covers all three.
 
