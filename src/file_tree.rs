@@ -494,6 +494,8 @@ mod tests {
             old_mode: "100644".into(),
             hunks: vec![],
             selected: true,
+            loaded: true,
+            source: None,
         }
     }
     struct Harness {

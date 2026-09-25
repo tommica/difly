@@ -15,22 +15,22 @@ use syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet};
 
 const CODE_SIZE: f32 = 15.0;
 #[derive(Clone, Copy)]
-struct Colors {
-    bg: Color32,
-    panel: Color32,
-    muted: Color32,
-    accent: Color32,
-    green: Color32,
-    add: Color32,
-    del: Color32,
-    border: Color32,
-    warn: Color32,
-    error_bg: Color32,
-    warning_bg: Color32,
-    included: Color32,
+pub(crate) struct Colors {
+    pub(crate) bg: Color32,
+    pub(crate) panel: Color32,
+    pub(crate) muted: Color32,
+    pub(crate) accent: Color32,
+    pub(crate) green: Color32,
+    pub(crate) add: Color32,
+    pub(crate) del: Color32,
+    pub(crate) border: Color32,
+    pub(crate) warn: Color32,
+    pub(crate) error_bg: Color32,
+    pub(crate) warning_bg: Color32,
+    pub(crate) included: Color32,
 }
 impl Colors {
-    fn new(dark: bool) -> Self {
+    pub(crate) fn new(dark: bool) -> Self {
         let rgb = |(r, g, b)| Color32::from_rgb(r, g, b);
         let values = if dark {
             [
@@ -124,7 +124,7 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
         style.visuals.warn_fg_color = Color32::from_rgb(125, 77, 8);
         style.visuals.error_fg_color = Color32::from_rgb(155, 34, 48);
         style.visuals.selection.bg_fill = Color32::from_rgb(190, 211, 249);
-        style.visuals.selection.stroke = Stroke::new(1.0, text);
+        style.visuals.selection.stroke = Stroke::new(1.0_f32, text);
         for widget in [
             &mut style.visuals.widgets.noninteractive,
             &mut style.visuals.widgets.inactive,
@@ -132,8 +132,8 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
             &mut style.visuals.widgets.active,
             &mut style.visuals.widgets.open,
         ] {
-            widget.fg_stroke = Stroke::new(1.0, text);
-            widget.bg_stroke = Stroke::new(1.0, colors.border);
+            widget.fg_stroke = Stroke::new(1.0_f32, text);
+            widget.bg_stroke = Stroke::new(1.0_f32, colors.border);
         }
         style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(222, 227, 236);
         style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(202, 215, 239);
@@ -163,24 +163,80 @@ struct Undo {
     before_mode: String,
     after_mode: String,
 }
-struct Highlight {
+pub(crate) struct Highlight {
     syntaxes: SyntaxSet,
     themes: ThemeSet,
-    cache: HashMap<(String, String, bool), egui::text::LayoutJob>,
+    cache: std::collections::VecDeque<(String, std::sync::Arc<Highlighted>)>,
+    budget: usize,
+}
+#[derive(Clone)]
+struct Span {
+    range: std::ops::Range<usize>,
+    color: Color32,
+}
+pub(crate) struct Highlighted {
+    text: String,
+    extension: String,
+    dark: bool,
+    spans: Vec<Span>,
+}
+impl Highlighted {
+    fn bytes(&self) -> usize {
+        self.text.capacity()
+            + self.extension.capacity()
+            + self.spans.capacity() * std::mem::size_of::<Span>()
+    }
+    pub(crate) fn job(&self, range: std::ops::Range<usize>) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = f32::INFINITY;
+        for span in self
+            .spans
+            .iter()
+            .skip(self.spans.partition_point(|s| s.range.end <= range.start))
+        {
+            if span.range.start >= range.end {
+                break;
+            }
+            let start = span.range.start.max(range.start);
+            let end = span.range.end.min(range.end);
+            job.append(
+                &self.text[start..end],
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::monospace(CODE_SIZE),
+                    color: span.color,
+                    ..Default::default()
+                },
+            );
+        }
+        job
+    }
 }
 impl Highlight {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             syntaxes: SyntaxSet::load_defaults_newlines(),
             themes: ThemeSet::load_defaults(),
-            cache: HashMap::new(),
+            cache: Default::default(),
+            budget: 8 * 1024 * 1024,
         }
     }
-    fn job(&mut self, text: &str, extension: &str, dark: bool) -> egui::text::LayoutJob {
-        let key = (extension.to_string(), text.to_string(), dark);
-        if let Some(job) = self.cache.get(&key) {
-            return job.clone();
+    pub(crate) fn document(
+        &mut self,
+        slot: &str,
+        text: &str,
+        extension: &str,
+        dark: bool,
+    ) -> std::sync::Arc<Highlighted> {
+        if let Some(i) = self.cache.iter().position(|(key, doc)| {
+            key == slot && doc.text == text && doc.extension == extension && doc.dark == dark
+        }) {
+            let entry = self.cache.remove(i).unwrap();
+            let doc = entry.1.clone();
+            self.cache.push_back(entry);
+            return doc;
         }
+        self.cache.retain(|(key, _)| key != slot);
         let syntax = self
             .syntaxes
             .find_syntax_by_extension(extension)
@@ -193,45 +249,83 @@ impl Highlight {
                 "InspiredGitHub"
             }],
         );
-        let mut job = egui::text::LayoutJob::default();
-        job.wrap.max_width = f32::INFINITY;
+        let mut spans: Vec<Span> = vec![];
+        let mut palette = HashMap::new();
+        let mut offset = 0;
         for line in text.split_inclusive('\n') {
-            match highlighter.highlight_line(line, &self.syntaxes) {
-                Ok(parts) => {
-                    for (style, part) in parts {
-                        job.append(
-                            part,
-                            0.0,
-                            egui::TextFormat {
-                                font_id: FontId::monospace(CODE_SIZE),
-                                color: syntax_color(style.foreground, dark),
-
-                                ..Default::default()
-                            },
-                        );
-                    }
-                }
-                Err(_) => job.append(
-                    line,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: FontId::monospace(CODE_SIZE),
-                        color: if dark {
+            let parts = highlighter
+                .highlight_line(line, &self.syntaxes)
+                .map(|parts| {
+                    parts
+                        .into_iter()
+                        .map(|(style, part)| {
+                            let color = *palette
+                                .entry(style.foreground)
+                                .or_insert_with(|| syntax_color(style.foreground, dark));
+                            (color, part)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|_| {
+                    vec![(
+                        if dark {
                             Color32::LIGHT_GRAY
                         } else {
                             Color32::from_gray(40)
                         },
-
-                        ..Default::default()
-                    },
-                ),
+                        line,
+                    )]
+                });
+            for (color, part) in parts {
+                if let Some(last) = spans.last_mut()
+                    && last.color == color
+                {
+                    last.range.end += part.len();
+                } else {
+                    spans.push(Span {
+                        range: offset..offset + part.len(),
+                        color,
+                    });
+                }
+                offset += part.len();
             }
         }
-        if self.cache.len() > 12 {
-            self.cache.clear();
+        let doc = std::sync::Arc::new(Highlighted {
+            text: text.into(),
+            extension: extension.into(),
+            dark,
+            spans,
+        });
+        let size = doc.bytes() + slot.len();
+        while self
+            .cache
+            .iter()
+            .map(|(key, d)| key.capacity() + d.bytes())
+            .sum::<usize>()
+            + size
+            > self.budget
+            && !self.cache.is_empty()
+        {
+            self.cache.pop_front();
         }
-        self.cache.insert(key, job.clone());
-        job
+        if size <= self.budget {
+            self.cache.push_back((slot.into(), doc.clone()));
+        }
+        doc
+    }
+    fn job_for(
+        &mut self,
+        slot: &str,
+        text: &str,
+        extension: &str,
+        dark: bool,
+    ) -> egui::text::LayoutJob {
+        self.document(slot, text, extension, dark)
+            .job(0..text.len())
+    }
+    #[cfg(test)]
+    fn job(&mut self, text: &str, extension: &str, dark: bool) -> egui::text::LayoutJob {
+        self.job_for("test", text, extension, dark)
     }
 }
 
@@ -261,6 +355,7 @@ pub struct App {
     last_scan: Instant,
     last_edit: Instant,
     highlight: Highlight,
+    virtual_diff: crate::virtual_diff::VirtualDiff,
     open: bool,
     open_path: String,
     filter: String,
@@ -307,6 +402,7 @@ impl App {
             last_scan: Instant::now(),
             last_edit: Instant::now(),
             highlight: Highlight::new(),
+            virtual_diff: Default::default(),
             open: false,
             open_path: path.display().to_string(),
             filter: String::new(),
@@ -349,8 +445,15 @@ impl App {
             let epoch = self.epoch;
             self.scanning = true;
             self.last_scan = Instant::now();
+            let active = self.active.clone();
             std::thread::spawn(move || {
-                let result = repo.scan();
+                let result = repo.scan_metadata().and_then(|mut files| {
+                    if let Some(file) = files.iter_mut().find(|f| Some(&f.path) == active.as_ref())
+                    {
+                        repo.load_preview(file)?;
+                    }
+                    Ok(files)
+                });
                 let _ = tx.send(Task::Scan(epoch, result));
             });
         }
@@ -360,15 +463,51 @@ impl App {
             if let Some(prev) = self
                 .files
                 .iter()
-                .find(|p| p.path == f.path && p.old == f.old && p.conflict == f.conflict)
+                .find(|p| p.path == f.path && p.conflict == f.conflict)
             {
-                if f.current == prev.current {
-                    f.hunks = prev.hunks.clone();
+                if f.source == prev.source {
+                    if f.loaded {
+                        for h in &mut f.hunks {
+                            if let Some(previous) =
+                                prev.hunks.iter().find(|p| p.old == h.old && p.new == h.new)
+                            {
+                                h.selected = previous.selected;
+                                h.review = previous.review;
+                            } else {
+                                h.selected = prev.selected;
+                            }
+                        }
+                    } else {
+                        f.hunks = prev.hunks.clone();
+                        for h in &mut f.hunks {
+                            h.added = String::new();
+                            h.removed = String::new();
+                        }
+                    }
                     f.selected = prev.selected;
-                } else {
+                    f.binary = prev.binary;
+                } else if f.loaded && prev.loaded && f.old == prev.old {
                     f.hunks =
                         model::refresh_hunks(&f.old_text(), &f.text(), &prev.hunks, prev.selected);
                     f.selected = prev.selected && f.hunks.iter().all(|h| h.selected);
+                } else {
+                    // Unopened whole-file choices survive refresh. Partial selections need review.
+                    f.selected = prev.selected;
+                    if !prev.hunks.is_empty()
+                        && prev
+                            .hunks
+                            .iter()
+                            .any(|h| h.selected != prev.selected || h.review)
+                    {
+                        f.hunks = prev.hunks.clone();
+                        for h in &mut f.hunks {
+                            h.review = true;
+                            h.selected = false;
+                            h.added.clear();
+                            h.removed.clear();
+                        }
+                        f.selected = false;
+                    }
                 }
             }
         }
@@ -385,7 +524,11 @@ impl App {
                 self.draft.clear();
             }
         } else if let Some(i) = self.index() {
-            self.draft = self.files[i].text();
+            self.draft = if self.files[i].binary {
+                String::new()
+            } else {
+                self.files[i].text()
+            };
         }
     }
     fn index(&self) -> Option<usize> {
@@ -398,10 +541,29 @@ impl App {
             self.error = Some("Save or reload the current edit before switching files.".into());
             return;
         }
+        self.epoch += 1; // Discard an in-flight scan of the previous active file.
+        self.virtual_diff = Default::default();
+        self.conflict_sources = Default::default();
+        for f in &mut self.files {
+            if f.path != path {
+                f.unload();
+            }
+        }
         self.active = Some(path.clone());
         self.hunk_cursor = 0;
         if let Some(i) = self.index() {
-            self.draft = self.files[i].text();
+            if let Some(repo) = &self.repo
+                && let Err(error) = repo.load_preview(&mut self.files[i])
+            {
+                self.error = Some(error.to_string());
+                self.draft.clear();
+                return;
+            }
+            self.draft = if self.files[i].binary {
+                String::new()
+            } else {
+                self.files[i].text()
+            };
             if self.files[i].conflict
                 && let Some(r) = &self.repo
             {
@@ -470,6 +632,10 @@ impl App {
         let Some(repo) = &self.repo else {
             return;
         };
+        if let Err(error) = repo.load_file(&mut self.files[i]) {
+            self.error = Some(error.to_string());
+            return;
+        }
         let f = &self.files[i];
         let before = f.exists.then(|| f.current.clone());
         let after = if let Some(h) = hunk {
@@ -535,6 +701,8 @@ impl App {
                 old_mode: u.before_mode.clone(),
                 hunks: vec![],
                 selected: true,
+                loaded: true,
+                source: None,
             };
             r.restore_work(&file, u.before.as_deref(), &u.before_mode)
         })();
@@ -881,7 +1049,7 @@ impl App {
                     } else {
                         Color32::from_rgb(220, 232, 252)
                     })
-                    .stroke(Stroke::new(1.0, colors.accent))
+                    .stroke(Stroke::new(1.0_f32, colors.accent))
                     .corner_radius(5);
                 let clicked = ui
                     .scope(|ui| {
@@ -967,9 +1135,13 @@ impl App {
             }
             ui.label(format!(
                 "{} bytes → {} bytes · Select the file to commit it as a whole.",
-                file.old.len(),
-                file.current.len()
+                file.sizes().0,
+                file.sizes().1
             ));
+            return;
+        }
+        if !file.loaded {
+            ui.label("Unable to load this file. Refresh to retry.");
             return;
         }
         if file.conflict {
@@ -1042,12 +1214,58 @@ impl App {
         let mut changed = false;
         let mut revert = None;
         let jump = self.jump_hunk.take();
+        // Keep egui's complete accessibility text tree when assistive technology requests it.
+        let accessible = ui.ctx().accesskit_node_builder(ui.id(), |_| ()).is_some();
+        if !accessible
+            && (old.len() + self.draft.len() > 64 * 1024
+                || old.lines().count().max(self.draft.lines().count()) > 500)
+        {
+            let outcome = self.virtual_diff.show(
+                ui,
+                editor_id,
+                &old,
+                &mut self.draft,
+                &mut self.files[i].hunks,
+                &mut self.highlight,
+                &ext,
+                crate::virtual_diff::Options {
+                    width: ui.available_width(),
+                    split: self.split_ratio,
+                    wrap: self.soft_wrap,
+                    unified: self.unified,
+                    dark: self.dark,
+                },
+                jump,
+            );
+            if let Some(split) = outcome.split {
+                self.split_ratio = split;
+            }
+            if outcome.selection_changed {
+                self.files[i].selected = self.files[i].hunks.iter().all(|h| h.selected);
+                self.epoch += 1;
+            }
+            let mut changed = outcome.changed;
+            if let Some(redo) = history_action
+                && let Some(text) = edit_history(ui.ctx(), editor_id, &self.draft, redo)
+            {
+                self.draft = text;
+                changed = true;
+            }
+            if changed {
+                self.save();
+            }
+            if let Some(h) = outcome.revert {
+                self.revert(Some(h));
+            }
+            return;
+        }
         egui::Frame::new().fill(colors.bg).show(ui, |ui| {
             let viewport_width = ui.available_width();
             let view = DiffLayout::build(
                 ui,
-                self.highlight.job(&old, &ext, self.dark),
-                self.highlight.job(&self.draft, &ext, self.dark),
+                self.highlight.job_for("old", &old, &ext, self.dark),
+                self.highlight
+                    .job_for("working", &self.draft, &ext, self.dark),
                 viewport_width,
                 self.unified,
                 self.soft_wrap,
@@ -1122,7 +1340,7 @@ impl App {
                             center.x + dx,
                             center.y - 4.0..=center.y + 4.0,
                             Stroke::new(
-                                1.0,
+                                1.0_f32,
                                 if divider.hovered() || divider.dragged() {
                                     colors.accent
                                 } else {
@@ -1163,7 +1381,7 @@ impl App {
                     ui.painter().vline(
                         new_origin.x,
                         origin.y..=origin.y + height + 28.0,
-                        Stroke::new(1.0, colors.border),
+                        Stroke::new(1.0_f32, colors.border),
                     );
                 }
                 for (h, range) in view.rows.hunk_rows.iter().enumerate() {
@@ -1267,8 +1485,9 @@ impl App {
                     } else {
                         DiffLayout::build(
                             ui,
-                            self.highlight.job(&old, &ext, self.dark),
-                            self.highlight.job(text.as_str(), &ext, self.dark),
+                            self.highlight.job_for("old", &old, &ext, self.dark),
+                            self.highlight
+                                .job_for("working", text.as_str(), &ext, self.dark),
                             viewport_width,
                             unified,
                             wrap,
@@ -1318,6 +1537,7 @@ impl App {
             return;
         };
         let result = (|| -> anyhow::Result<Option<Vec<u8>>> {
+            repo.load_file(&mut self.files[i])?;
             let bytes = repo.conflict_blob(&self.files[i].path, stage)?;
             repo.restore_work(&self.files[i], bytes.as_deref(), &self.files[i].mode)?;
             Ok(bytes)
@@ -1561,7 +1781,7 @@ impl eframe::App for App {
 }
 // Route Cmd/Ctrl+R through egui's native redo event, including commit-message
 // fields, while keeping Cmd/Ctrl+Z's normal focused-editor behavior.
-fn map_redo_shortcut(ctx: &egui::Context) {
+pub(crate) fn map_redo_shortcut(ctx: &egui::Context) {
     ctx.input_mut(|input| {
         for event in &mut input.events {
             if let egui::Event::Key {
@@ -1678,6 +1898,63 @@ fn paint_rows(ui: &egui::Ui, view: &DiffLayout, old: Pos2, new: Pos2, unified: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlight_cache_replaces_versions_and_obeys_byte_budget() {
+        let mut high = Highlight::new();
+        high.budget = 32 * 1024;
+        for i in 0..30 {
+            high.document(
+                "working",
+                &format!("{}// version {i}\n", "let n = 42;\n".repeat(100)),
+                "rs",
+                false,
+            );
+            assert!(high.cache.len() <= 1);
+            assert!(
+                high.cache
+                    .iter()
+                    .map(|(key, d)| key.capacity() + d.bytes())
+                    .sum::<usize>()
+                    <= high.budget
+            );
+        }
+        high.document("old", "let old = 1;", "rs", false);
+        assert_eq!(high.cache.len(), 2);
+        high.document(
+            "working",
+            &"let much_larger = 12;\n".repeat(10_000),
+            "rs",
+            false,
+        );
+        assert!(
+            high.cache
+                .iter()
+                .map(|(key, d)| key.capacity() + d.bytes())
+                .sum::<usize>()
+                <= high.budget
+        );
+        assert!(high.cache.iter().all(|(key, _)| key != "working"));
+    }
+    #[test]
+    fn visible_syntax_preserves_multiline_state_and_utf8() {
+        let mut high = Highlight::new();
+        let text = "/* comment starts\nαβ still comment\n*/ let x = 42;\n";
+        let doc = high.document("working", text, "rs", false);
+        let start = text.find('α').unwrap();
+        let end = text.find("*/").unwrap();
+        let visible = doc.job(start..end);
+        assert_eq!(visible.text, &text[start..end]);
+        let whole = doc.job(0..text.len());
+        let expected = whole
+            .sections
+            .iter()
+            .find(|s| s.byte_range.contains(&start))
+            .unwrap()
+            .format
+            .color;
+        assert!(visible.sections.iter().all(|s| s.format.color == expected));
+    }
 
     #[test]
     fn scrolling_keeps_diff_background_under_visible_text() {

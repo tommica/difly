@@ -647,3 +647,157 @@ fn older_amend_hook_failure_preserves_original_history() {
         1
     );
 }
+
+#[test]
+fn metadata_scan_and_binary_preview_do_not_retain_payloads() {
+    let (_temp, r) = repo();
+    seed(&r);
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        fs::write(r.root.join(name), vec![0; 1024 * 1024]).unwrap();
+    }
+    let mut files = r.scan_metadata().unwrap();
+    assert_eq!(files.len(), 3);
+    for file in &mut files {
+        assert!(!file.loaded && !file.included());
+        assert!(file.old.is_empty() && file.current.is_empty());
+        r.load_preview(file).unwrap();
+        assert!(file.binary && !file.loaded);
+        assert_eq!(file.sizes(), (0, 1024 * 1024));
+    }
+    files[0].select(true);
+    r.commit(&files, "one binary", false, r.head().as_deref())
+        .unwrap();
+    assert_eq!(r.blob("HEAD:a.bin").unwrap().len(), 1024 * 1024);
+    assert!(r.blob("HEAD:b.bin").is_err());
+}
+#[test]
+fn unloaded_partial_selection_survives_reopen_and_commit() {
+    let (_temp, r) = repo();
+    seed(&r);
+    fs::write(r.root.join("file.txt"), "ONE\ntwo\nthree\nfour\nFIVE\n").unwrap();
+    let mut files = r.scan_metadata().unwrap();
+    r.load_file(&mut files[0]).unwrap();
+    files[0].select(false);
+    files[0].hunks[0].selected = true;
+    files[0].unload();
+    assert!(files[0].old.is_empty() && files[0].current.is_empty());
+    assert!(
+        files[0]
+            .hunks
+            .iter()
+            .all(|h| h.added.is_empty() && h.removed.is_empty())
+    );
+    r.load_file(&mut files[0]).unwrap();
+    assert!(files[0].hunks[0].selected && !files[0].hunks[1].selected);
+    files[0].unload();
+    r.commit(&files, "partial lazy", false, r.head().as_deref())
+        .unwrap();
+    assert_eq!(
+        r.blob("HEAD:file.txt").unwrap(),
+        b"ONE\ntwo\nthree\nfour\nfive\n"
+    );
+}
+#[test]
+fn lazy_operations_reject_external_changes() {
+    let (_temp, r) = repo();
+    seed(&r);
+    fs::write(r.root.join("file.txt"), "first change\n").unwrap();
+    let mut files = r.scan_metadata().unwrap();
+    let head = r.head();
+    fs::write(r.root.join("file.txt"), "later change\n").unwrap();
+    assert!(r.load_file(&mut files[0]).is_err());
+    assert!(r.commit(&files, "stale", false, head.as_deref()).is_err());
+    assert_eq!(r.head(), head);
+}
+#[test]
+fn lazy_autosave_updates_snapshot_and_preserves_exclusion() {
+    let (_temp, r) = repo();
+    seed(&r);
+    fs::write(r.root.join("file.txt"), "ONE\ntwo\nthree\nfour\nfive\n").unwrap();
+    let mut file = r.scan_metadata().unwrap().remove(0);
+    r.load_file(&mut file).unwrap();
+    file.select(false);
+    r.save(&mut file, "EDITED\ntwo\nthree\nfour\nfive\n")
+        .unwrap();
+    file.unload();
+    r.load_file(&mut file).unwrap();
+    assert!(!file.included());
+    assert!(file.text().starts_with("EDITED"));
+}
+#[test]
+fn metadata_scan_ignores_staged_content_restored_in_worktree() {
+    let (_temp, r) = repo();
+    seed(&r);
+    let original = fs::read(r.root.join("file.txt")).unwrap();
+    fs::write(r.root.join("file.txt"), "staged\n").unwrap();
+    git(&r.root, &["add", "file.txt"]);
+    fs::write(r.root.join("file.txt"), original).unwrap();
+    assert!(r.scan_metadata().unwrap().is_empty());
+}
+#[test]
+fn lazy_deletion_and_untracked_initial_commit() {
+    let (_temp, r) = repo();
+    fs::write(r.root.join("new.txt"), "new\n").unwrap();
+    let mut files = r.scan_metadata().unwrap();
+    files[0].select(true);
+    r.commit(&files, "initial lazy", false, None).unwrap();
+    fs::remove_file(r.root.join("new.txt")).unwrap();
+    let files = r.scan_metadata().unwrap();
+    r.commit(&files, "delete lazy", false, r.head().as_deref())
+        .unwrap();
+    assert!(r.scan_metadata().unwrap().is_empty());
+    assert!(r.blob("HEAD:new.txt").is_err());
+}
+
+#[test]
+fn lazy_older_amend_replays_history_without_loading_all_files() {
+    let (_temp, r) = repo();
+    seed(&r);
+    let target = r.head().unwrap();
+    fs::write(r.root.join("other.txt"), "later\n").unwrap();
+    git(&r.root, &["add", "."]);
+    git(&r.root, &["commit", "-m", "later"]);
+    fs::write(r.root.join("file.txt"), "ONE\ntwo\nthree\nfour\nfive\n").unwrap();
+    let files = r.scan_metadata().unwrap();
+    assert!(files.iter().all(|f| !f.loaded));
+    r.amend_commit(&files, "amended", &target, r.head().as_deref())
+        .unwrap();
+    assert_eq!(
+        r.blob("HEAD~1:file.txt").unwrap(),
+        b"ONE\ntwo\nthree\nfour\nfive\n"
+    );
+    assert_eq!(r.blob("HEAD:other.txt").unwrap(), b"later\n");
+}
+#[test]
+fn lazy_merge_resolution_and_commit_preserve_two_parents() {
+    let (_temp, r) = repo();
+    seed(&r);
+    git(&r.root, &["checkout", "-b", "side"]);
+    fs::write(r.root.join("file.txt"), "side\n").unwrap();
+    git(&r.root, &["commit", "-am", "side"]);
+    git(&r.root, &["checkout", "main"]);
+    fs::write(r.root.join("file.txt"), "main\n").unwrap();
+    git(&r.root, &["commit", "-am", "main"]);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&r.root)
+        .args(["merge", "side"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let mut file = r.scan_metadata().unwrap().remove(0);
+    assert!(file.conflict);
+    r.load_file(&mut file).unwrap();
+    r.save(&mut file, "resolved\n").unwrap();
+    r.resolve(&file).unwrap();
+    let files = r.scan_metadata().unwrap();
+    r.commit(&files, "merge lazy", false, r.head().as_deref())
+        .unwrap();
+    assert_eq!(
+        git(&r.root, &["rev-list", "--parents", "-1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        3
+    );
+    assert_eq!(r.blob("HEAD:file.txt").unwrap(), b"resolved\n");
+}

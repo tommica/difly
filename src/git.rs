@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{
     ffi::{OsStr, OsString},
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -23,6 +23,22 @@ impl CommitInfo {
     }
 }
 
+/// Identity of an unopened file. No file payloads are retained by repository scans.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSource {
+    pub oid: Option<String>,
+    pub old_size: u64,
+    pub work: WorkStamp,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkStamp {
+    pub size: u64,
+    modified: Option<std::time::SystemTime>,
+    exists: bool,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
 #[derive(Clone, Debug)]
 pub struct File {
     pub path: PathBuf,
@@ -37,8 +53,32 @@ pub struct File {
     pub old_mode: String,
     pub hunks: Vec<Hunk>,
     pub selected: bool,
+    pub loaded: bool,
+    pub source: Option<FileSource>,
 }
 impl File {
+    pub fn sizes(&self) -> (u64, u64) {
+        if self.loaded {
+            (self.old.len() as u64, self.current.len() as u64)
+        } else {
+            self.source
+                .as_ref()
+                .map(|s| (s.old_size, s.work.size))
+                .unwrap_or_default()
+        }
+    }
+    pub fn unload(&mut self) {
+        if self.source.is_some() {
+            self.old = Vec::new();
+            self.current = Vec::new();
+            for h in &mut self.hunks {
+                h.added = String::new();
+                h.removed = String::new();
+            }
+            self.loaded = false;
+        }
+    }
+
     pub fn old_text(&self) -> String {
         String::from_utf8_lossy(&self.old).into_owned()
     }
@@ -118,7 +158,9 @@ impl Repo {
         let data = self.git(&["log", "--first-parent", "-40", "--format=%H%x00%B%x00"])?;
         let fields: Vec<_> = data.split(|&b| b == 0).collect();
         Ok(fields
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|parts| CommitInfo {
                 oid: String::from_utf8_lossy(parts[0]).trim().into(),
                 message: String::from_utf8_lossy(parts[1]).trim_end().into(),
@@ -212,11 +254,7 @@ impl Repo {
                 "Branch changed during rewrite; nothing was published"
             );
             for f in files {
-                ensure!(
-                    self.read_work(&f.path)? == f.exists.then(|| f.current.clone())
-                        && work_mode(&self.root.join(&f.path), &f.mode) == f.mode,
-                    "Working files changed during rewrite; nothing was published"
-                );
+                self.ensure_current(f)?;
             }
             // Keep the original chain reachable for recovery, then compare-and-swap the branch.
             let backup = format!("refs/difly/before-amend/{rewritten}");
@@ -342,6 +380,192 @@ impl Repo {
         }
         Ok(full)
     }
+    pub fn scan_metadata(&self) -> Result<Vec<File>> {
+        let status = self.git(&[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ])?;
+        let tree = if self.head().is_some() {
+            self.git(&["ls-tree", "-r", "-l", "-z", "HEAD"])?
+        } else {
+            vec![]
+        };
+        let mut entries = std::collections::HashMap::new();
+        for record in tree.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+            let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let fields: Vec<_> = record[..tab]
+                .split(|b| b.is_ascii_whitespace())
+                .filter(|s| !s.is_empty())
+                .collect();
+            entries.insert(
+                bytes_path(&record[tab + 1..]),
+                (
+                    String::from_utf8_lossy(fields[0]).into_owned(),
+                    String::from_utf8_lossy(fields[2]).into_owned(),
+                    std::str::from_utf8(fields[3])
+                        .unwrap_or("0")
+                        .parse::<u64>()
+                        .unwrap_or(0),
+                ),
+            );
+        }
+        let changed = if self.head().is_some() {
+            Some(
+                self.git(&["diff", "--name-only", "-z", "HEAD", "--"])?
+                    .split(|&b| b == 0)
+                    .filter(|p| !p.is_empty())
+                    .map(bytes_path)
+                    .collect::<std::collections::HashSet<_>>(),
+            )
+        } else {
+            None
+        };
+        let mut files = Vec::new();
+        for record in status.split(|&b| b == 0).filter(|r| r.len() > 3) {
+            let code = &record[..2];
+            let path = bytes_path(&record[3..]);
+            if code != b"??"
+                && !code.contains(&b'U')
+                && code != b"AA"
+                && code != b"DD"
+                && changed.as_ref().is_some_and(|paths| !paths.contains(&path))
+            {
+                continue;
+            }
+            let entry = entries.get(&path);
+            let old_mode = entry
+                .map(|e| e.0.clone())
+                .unwrap_or_else(|| "100644".into());
+            ensure!(
+                old_mode != "160000",
+                "Submodules are not supported: {}",
+                path.display()
+            );
+            let full = self.safe_path(&path)?;
+            let work = work_stamp(&full)?;
+            let mode = work_mode(&full, &old_mode);
+            let tracked = code != b"??";
+            let conflict = code.contains(&b'U') || code == b"AA" || code == b"DD";
+            files.push(File {
+                path,
+                old: vec![],
+                current: vec![],
+                exists: work.exists,
+                base_exists: entry.is_some(),
+                tracked,
+                conflict,
+                binary: mode == "120000" || old_mode == "120000",
+                mode,
+                old_mode,
+                hunks: vec![],
+                selected: tracked && !conflict,
+                loaded: false,
+                source: Some(FileSource {
+                    oid: entry.map(|e| e.1.clone()),
+                    old_size: entry.map(|e| e.2).unwrap_or(0),
+                    work,
+                }),
+            });
+        }
+        files.sort_by(|a, b| (!a.tracked, &a.path).cmp(&(!b.tracked, &b.path)));
+        Ok(files)
+    }
+
+    /// Load exactly one file, checking the scan snapshot before and after reading.
+    pub fn load_file(&self, file: &mut File) -> Result<()> {
+        if file.loaded {
+            return Ok(());
+        }
+        self.ensure_current(file)?;
+        let source = file.source.as_ref().context("Missing file snapshot")?;
+        let old = if let Some(oid) = &source.oid {
+            if file.old_mode == "120000" {
+                self.git(&["cat-file", "blob", oid])?
+            } else {
+                let mut path_arg = OsString::from("--path=");
+                path_arg.push(&file.path);
+                self.run(&[
+                    OsStr::new("cat-file"),
+                    OsStr::new("--filters"),
+                    &path_arg,
+                    OsStr::new(oid),
+                ])?
+            }
+        } else {
+            vec![]
+        };
+        let current = self.read_work(&file.path)?.unwrap_or_default();
+        self.ensure_current(file)?;
+        let binary = old.contains(&0)
+            || current.contains(&0)
+            || std::str::from_utf8(&old).is_err()
+            || std::str::from_utf8(&current).is_err()
+            || file.mode == "120000"
+            || file.old_mode == "120000";
+        let mut hunks = if binary {
+            vec![]
+        } else {
+            model::hunks(std::str::from_utf8(&old)?, std::str::from_utf8(&current)?)
+        };
+        for h in &mut hunks {
+            if let Some(previous) = file.hunks.iter().find(|p| p.old == h.old && p.new == h.new) {
+                h.selected = previous.selected;
+                h.review = previous.review;
+            } else {
+                h.selected = file.selected;
+            }
+        }
+        file.old = old;
+        file.current = current;
+        file.hunks = hunks;
+        file.binary = binary;
+        file.loaded = true;
+        Ok(())
+    }
+
+    /// A binary preview needs only metadata. Full bytes are read on commit/revert.
+    pub fn load_preview(&self, file: &mut File) -> Result<()> {
+        if file.loaded {
+            return Ok(());
+        }
+        self.ensure_current(file)?;
+        if file.exists && file.mode != "120000" {
+            let mut sample = [0; 8192];
+            let count = fs::File::open(self.safe_path(&file.path)?)?.read(&mut sample)?;
+            if sample[..count].contains(&0) {
+                file.binary = true;
+            }
+        }
+        if !file.binary {
+            self.load_file(file)?;
+            if file.binary {
+                file.unload();
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_current(&self, file: &File) -> Result<()> {
+        let unchanged = if file.loaded {
+            self.read_work(&file.path)?.as_deref() == file.exists.then_some(file.current.as_slice())
+        } else if let Some(source) = &file.source {
+            work_stamp(&self.safe_path(&file.path)?)? == source.work
+        } else {
+            false
+        };
+        ensure!(
+            unchanged && work_mode(&self.root.join(&file.path), &file.mode) == file.mode,
+            "{} changed outside Difly; reload before continuing",
+            file.path.display()
+        );
+        Ok(())
+    }
+
     pub fn scan(&self) -> Result<Vec<File>> {
         let status = self.git(&[
             "status",
@@ -394,12 +618,15 @@ impl Repo {
                 old_mode,
                 hunks,
                 selected: tracked && !conflict,
+                loaded: true,
+                source: None,
             });
         }
         files.sort_by(|a, b| (!a.tracked, &a.path).cmp(&(!b.tracked, &b.path)));
         Ok(files)
     }
     pub fn save(&self, file: &mut File, text: &str) -> Result<()> {
+        ensure!(file.loaded, "Load the file before editing");
         ensure!(!file.binary, "Binary files and symlinks cannot be edited");
         ensure!(
             self.read_work(&file.path)? == file.exists.then(|| file.current.clone()),
@@ -415,10 +642,14 @@ impl Repo {
         file.hunks = model::refresh_hunks(&file.old_text(), text, &file.hunks, was_selected);
         file.current = text.as_bytes().to_vec();
         file.exists = true;
+        if let Some(source) = &mut file.source {
+            source.work = work_stamp(&full)?;
+        }
         file.selected = !file.hunks.is_empty() && file.hunks.iter().all(|h| h.selected);
         Ok(())
     }
     pub fn restore_work(&self, file: &File, bytes: Option<&[u8]>, mode: &str) -> Result<()> {
+        ensure!(file.loaded, "Load the file before reverting");
         ensure!(
             self.read_work(&file.path)? == file.exists.then(|| file.current.clone()),
             "File changed outside Difly; reload before reverting"
@@ -461,6 +692,7 @@ impl Repo {
         Ok(())
     }
     pub fn resolve(&self, file: &File) -> Result<()> {
+        ensure!(file.loaded, "Load the file before resolving");
         ensure!(file.conflict, "File is not conflicted");
         ensure!(
             !file
@@ -559,24 +791,15 @@ impl Repo {
             "A merge must include all tracked changes"
         );
         for f in files {
-            ensure!(
-                self.read_work(&f.path)? == f.exists.then(|| f.current.clone()),
-                "{} changed outside Difly; reload before committing",
-                f.path.display()
-            );
-        }
-        for f in files {
-            ensure!(
-                work_mode(&self.root.join(&f.path), &f.mode) == f.mode,
-                "File permissions changed outside Difly; reload first"
-            );
+            self.ensure_current(f)?;
         }
         if merge {
-            let fresh = self.scan()?;
+            let fresh = self.scan_metadata()?;
             ensure!(
-                fresh.iter().filter(|f| f.tracked).all(|f| files
+                fresh
                     .iter()
-                    .any(|p| p.path == f.path && p.current == f.current && p.exists == f.exists)),
+                    .filter(|f| f.tracked)
+                    .all(|f| files.iter().any(|p| p.path == f.path)),
                 "Merge changed outside Difly; reload before committing"
             );
         }
@@ -606,7 +829,10 @@ impl Repo {
         } else {
             run(&[OsStr::new("read-tree"), OsStr::new("--empty")], None)?;
         }
-        for f in files.iter().filter(|f| f.included()) {
+        for snapshot in files.iter().filter(|f| f.included()) {
+            let mut loaded = snapshot.clone();
+            self.load_file(&mut loaded)?;
+            let f = &loaded;
             if !f.exists && f.hunks.iter().all(|h| h.selected) {
                 run(
                     &[
@@ -727,4 +953,28 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+fn work_stamp(path: &Path) -> Result<WorkStamp> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt;
+            Ok(WorkStamp {
+                size: meta.len(),
+                modified: meta.modified().ok(),
+                exists: true,
+                #[cfg(unix)]
+                identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(WorkStamp {
+            size: 0,
+            modified: None,
+            exists: false,
+            #[cfg(unix)]
+            identity: (0, 0, 0, 0),
+        }),
+        Err(e) => Err(e.into()),
+    }
 }

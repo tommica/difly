@@ -2,6 +2,7 @@ mod diff_view;
 mod file_tree;
 mod icon;
 mod ui;
+mod virtual_diff;
 use std::path::PathBuf;
 fn main() -> eframe::Result {
     let mut args = std::env::args_os().skip(1);

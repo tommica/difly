@@ -51,7 +51,9 @@ mod tests {
         assert_eq!(icon.rgba[3], 0);
         assert!(
             icon.rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[3] == 255 && p[1] > p[0])
         );
     }
