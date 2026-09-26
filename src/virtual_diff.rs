@@ -56,6 +56,7 @@ pub(crate) struct Outcome {
     pub selection_changed: bool,
     pub revert: Option<usize>,
     pub split: Option<f32>,
+    pub jump: Option<usize>,
 }
 
 fn char_byte(text: &str, index: usize) -> usize {
@@ -359,6 +360,14 @@ impl VirtualDiff {
         options: Options,
         jump: Option<usize>,
     ) -> Outcome {
+        let (content, rail) = crate::diff_navigation::areas(ui.available_rect_before_wrap());
+        let options = Options {
+            width: content.width(),
+            ..options
+        };
+        if jump.is_some() {
+            self.follow_cursor = false;
+        }
         if self.geometry.as_ref().is_none_or(|g| {
             g.old != old
                 || g.new != *text
@@ -383,551 +392,605 @@ impl VirtualDiff {
         if let Some(range) = jump.and_then(|h| g.rows.hunk_rows.get(h)) {
             scroll = scroll.vertical_scroll_offset(g.offsets[range.start]);
         }
-        scroll.show(ui, |ui| {
-            let origin = ui.cursor().min;
-            let width = GUTTER
-                + if options.unified {
-                    g.new_width
-                } else {
-                    g.old_width + g.new_width
-                };
-            let height = g.height.max(ui.clip_rect().height() - 28.0);
-            ui.allocate_space(Vec2::new(width, height + 28.0));
-            let control_x = origin.x + if options.unified { 0.0 } else { g.old_width };
-            let old_origin = origin + Vec2::new(if options.unified { GUTTER } else { 0.0 }, 28.0);
-            let new_origin = if options.unified {
-                old_origin
-            } else {
-                origin + Vec2::new(g.old_width + GUTTER, 28.0)
-            };
-            ui.painter().rect_filled(
-                Rect::from_min_size(
-                    Pos2::new(control_x, origin.y),
-                    Vec2::new(GUTTER, height + 28.0),
-                ),
-                0.0,
-                colors.panel,
-            );
-            if !options.unified {
-                let rect = Rect::from_min_size(
-                    Pos2::new(control_x, origin.y),
-                    Vec2::new(GUTTER, height + 28.0),
-                );
-                let response = ui
-                    .interact(rect, id.with("divider"), Sense::click_and_drag())
-                    .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-                for dx in [-4.0, 0.0, 4.0] {
-                    ui.painter().vline(
-                        rect.center().x + dx,
-                        origin.y + 10.0..=origin.y + 18.0,
-                        Stroke::new(1.0_f32, colors.muted),
+        let output = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+                scroll.show(ui, |ui| {
+                    let origin = ui.cursor().min;
+                    let width = GUTTER
+                        + if options.unified {
+                            g.new_width
+                        } else {
+                            g.old_width + g.new_width
+                        };
+                    let height = g.height.max(ui.clip_rect().height() - 28.0);
+                    ui.allocate_space(Vec2::new(width, height + 28.0));
+                    let control_x = origin.x + if options.unified { 0.0 } else { g.old_width };
+                    let old_origin =
+                        origin + Vec2::new(if options.unified { GUTTER } else { 0.0 }, 28.0);
+                    let new_origin = if options.unified {
+                        old_origin
+                    } else {
+                        origin + Vec2::new(g.old_width + GUTTER, 28.0)
+                    };
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(
+                            Pos2::new(control_x, origin.y),
+                            Vec2::new(GUTTER, height + 28.0),
+                        ),
+                        0.0,
+                        colors.panel,
                     );
-                }
-                if response.dragged() {
-                    out.split = Some(
-                        (options.split
-                            + ui.input(|i| i.pointer.delta().x) / (options.width - GUTTER))
-                            .clamp(0.1, 0.9),
-                    );
-                }
-                if response.double_clicked() {
-                    out.split = Some(0.5);
-                }
-            }
-            ui.painter().text(
-                old_origin + Vec2::new(8.0, -16.0),
-                egui::Align2::LEFT_CENTER,
-                if options.unified {
-                    "WORKING FILE · removed lines are read-only"
-                } else {
-                    "HEAD · read-only"
-                },
-                FontId::proportional(11.0),
-                colors.muted,
-            );
-            if !options.unified {
-                ui.painter().text(
-                    new_origin + Vec2::new(8.0, -16.0),
-                    egui::Align2::LEFT_CENTER,
-                    "WORKING FILE · editable",
-                    FontId::proportional(11.0),
-                    colors.muted,
-                );
-            }
-            let visible_start = (ui.clip_rect().top() - new_origin.y).max(0.0);
-            let visible_end = ui.clip_rect().bottom() - new_origin.y;
-            let first = g
-                .offsets
-                .partition_point(|&y| y < visible_start)
-                .saturating_sub(1);
-            let last = g
-                .offsets
-                .partition_point(|&y| y <= visible_end)
-                .min(g.rows.rows.len());
-            for (h, range) in g.rows.hunk_rows.iter().enumerate() {
-                let top = new_origin.y + g.offsets[range.start];
-                let bottom = new_origin.y + g.offsets[range.end];
-                if bottom < ui.clip_rect().top() || top > ui.clip_rect().bottom() {
-                    continue;
-                }
-                if let Some(hunk) = hunks.get_mut(h) {
-                    if hunk.selected {
-                        ui.painter().rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(control_x, top),
-                                Pos2::new(control_x + GUTTER, bottom),
-                            ),
-                            0.0,
-                            colors.included,
+                    if !options.unified {
+                        let rect = Rect::from_min_size(
+                            Pos2::new(control_x, origin.y),
+                            Vec2::new(GUTTER, height + 28.0),
                         );
+                        let response = ui
+                            .interact(rect, id.with("divider"), Sense::click_and_drag())
+                            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+                        for dx in [-4.0, 0.0, 4.0] {
+                            ui.painter().vline(
+                                rect.center().x + dx,
+                                origin.y + 10.0..=origin.y + 18.0,
+                                Stroke::new(1.0_f32, colors.muted),
+                            );
+                        }
+                        if response.dragged() {
+                            out.split = Some(
+                                (options.split
+                                    + ui.input(|i| i.pointer.delta().x) / (options.width - GUTTER))
+                                    .clamp(0.1, 0.9),
+                            );
+                        }
+                        if response.double_clicked() {
+                            out.split = Some(0.5);
+                        }
                     }
-                    // Keep controls reachable when the beginning of a large hunk scrolls away.
-                    let y = top.max(ui.clip_rect().top()).min(bottom - LINE_HEIGHT);
-                    if ui
-                        .put(
-                            Rect::from_min_size(
-                                Pos2::new(control_x + 34.0, y),
-                                Vec2::new(25.0, LINE_HEIGHT),
-                            ),
-                            egui::Checkbox::without_text(&mut hunk.selected),
-                        )
-                        .changed()
-                    {
-                        hunk.review = false;
-                        out.selection_changed = true;
-                    }
-                    if ui
-                        .put(
-                            Rect::from_min_size(
-                                Pos2::new(control_x + 3.0, y),
-                                Vec2::new(28.0, LINE_HEIGHT),
-                            ),
-                            egui::Button::new(">>").frame(false),
-                        )
-                        .on_hover_text("Revert this hunk")
-                        .clicked()
-                    {
-                        out.revert = Some(h);
-                    }
-                    if hunk.review {
-                        ui.painter().circle_filled(
-                            Pos2::new(control_x + 60.0, y + 4.0),
-                            3.0,
-                            colors.warn,
-                        );
-                    }
-                }
-            }
-            for row in first..last {
-                let (a, b) = g.rows.rows[row];
-                let changed = g.rows.hunk_rows.iter().any(|r| r.contains(&row));
-                for is_old in [true, false] {
-                    if options.unified && is_old && b.is_some() {
-                        continue;
-                    }
-                    let line = if is_old { a } else { b };
-                    let origin = if is_old { old_origin } else { new_origin };
-                    let pane = if is_old { g.old_width } else { g.new_width };
-                    let row_rect = Rect::from_min_size(
-                        origin + Vec2::new(0.0, g.offsets[row]),
-                        Vec2::new(pane, g.offsets[row + 1] - g.offsets[row]),
-                    );
-                    if changed && line.is_some() {
-                        ui.painter().rect_filled(
-                            row_rect,
-                            0.0,
-                            if is_old { colors.del } else { colors.add },
-                        );
-                    }
-                    let Some(line) = line else { continue };
                     ui.painter().text(
-                        origin + Vec2::new(37.0, g.offsets[row] + LINE_HEIGHT * 0.5),
-                        egui::Align2::RIGHT_CENTER,
-                        (line + 1).to_string(),
-                        FontId::monospace(FONT_SIZE),
+                        old_origin + Vec2::new(8.0, -16.0),
+                        egui::Align2::LEFT_CENTER,
+                        if options.unified {
+                            "WORKING FILE · removed lines are read-only"
+                        } else {
+                            "HEAD · read-only"
+                        },
+                        FontId::proportional(11.0),
                         colors.muted,
                     );
-                }
-            }
-            // Input and selection use full-document character positions, independent of rendered rows.
-            for is_old in [true, false] {
-                if is_old && options.unified {
-                    continue;
-                }
-                let editor_id = if is_old { id.with("old-virtual") } else { id };
-                let origin = if is_old { old_origin } else { new_origin };
-                let pane = if is_old { g.old_width } else { g.new_width };
-                let rect = Rect::from_min_size(
-                    origin + Vec2::new(TEXT_INSET, 0.0),
-                    Vec2::new(pane - TEXT_INSET - TEXT_PADDING, height),
-                );
-                let response = ui
-                    .interact(
-                        rect.intersect(ui.clip_rect()),
-                        editor_id,
-                        Sense::click_and_drag(),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::Text);
-                if !is_old && response.hovered() && ui.is_enabled() {
-                    ui.output_mut(|o| o.mutable_text_under_cursor = true);
-                }
-                if response.has_focus() && ui.is_enabled() {
-                    ui.memory_mut(|m| {
-                        m.set_focus_lock_filter(
-                            editor_id,
-                            egui::EventFilter {
-                                horizontal_arrows: true,
-                                vertical_arrows: true,
-                                tab: true,
-                                ..Default::default()
-                            },
-                        )
-                    });
-                }
-                let mut state =
-                    egui::text_edit::TextEditState::load(ui.ctx(), editor_id).unwrap_or_default();
-                let mut cursor = state.cursor.char_range().unwrap_or_default();
-                let content = if is_old { old } else { text.as_str() };
-                let count = content.chars().count();
-                cursor.primary.index = cursor.primary.index.min(count);
-                cursor.secondary.index = cursor.secondary.index.min(count);
-                let mut follow = false;
-                let pressed =
-                    response.is_pointer_button_down_on() && ui.input(|i| i.pointer.any_pressed());
-                if (pressed || response.clicked() || response.dragged())
-                    && let Some(pointer) = ui.input(|i| i.pointer.interact_pos())
-                {
-                    response.request_focus();
-                    let pos = g.hit(
-                        ui,
-                        Pos2::new(pointer.x - rect.left(), pointer.y - origin.y),
-                        is_old,
-                    );
-                    let extend =
-                        (!pressed && response.dragged()) || ui.input(|i| i.modifiers.shift);
-                    move_to(&mut cursor, pos, extend);
-                    if response.double_clicked() {
-                        cursor = CCursorRange::two(
-                            CCursor::new(word_left(content, pos)),
-                            CCursor::new(word_right(content, pos)),
+                    if !options.unified {
+                        ui.painter().text(
+                            new_origin + Vec2::new(8.0, -16.0),
+                            egui::Align2::LEFT_CENTER,
+                            "WORKING FILE · editable",
+                            FontId::proportional(11.0),
+                            colors.muted,
                         );
                     }
-                    self.preferred_x = None;
-                    if response.dragged() {
-                        ui.scroll_to_rect(Rect::from_min_size(pointer, Vec2::splat(2.0)), None);
+                    let visible_start = (ui.clip_rect().top() - new_origin.y).max(0.0);
+                    let visible_end = ui.clip_rect().bottom() - new_origin.y;
+                    let first = g
+                        .offsets
+                        .partition_point(|&y| y < visible_start)
+                        .saturating_sub(1);
+                    let last = g
+                        .offsets
+                        .partition_point(|&y| y <= visible_end)
+                        .min(g.rows.rows.len());
+                    for (h, range) in g.rows.hunk_rows.iter().enumerate() {
+                        let top = new_origin.y + g.offsets[range.start];
+                        let bottom = new_origin.y + g.offsets[range.end];
+                        if bottom < ui.clip_rect().top() || top > ui.clip_rect().bottom() {
+                            continue;
+                        }
+                        if let Some(hunk) = hunks.get_mut(h) {
+                            if hunk.selected {
+                                ui.painter().rect_filled(
+                                    Rect::from_min_max(
+                                        Pos2::new(control_x, top),
+                                        Pos2::new(control_x + GUTTER, bottom),
+                                    ),
+                                    0.0,
+                                    colors.included,
+                                );
+                            }
+                            // Keep controls reachable when the beginning of a large hunk scrolls away.
+                            let y = top.max(ui.clip_rect().top()).min(bottom - LINE_HEIGHT);
+                            if ui
+                                .put(
+                                    Rect::from_min_size(
+                                        Pos2::new(control_x + 34.0, y),
+                                        Vec2::new(25.0, LINE_HEIGHT),
+                                    ),
+                                    egui::Checkbox::without_text(&mut hunk.selected),
+                                )
+                                .changed()
+                            {
+                                hunk.review = false;
+                                out.selection_changed = true;
+                            }
+                            if ui
+                                .put(
+                                    Rect::from_min_size(
+                                        Pos2::new(control_x + 3.0, y),
+                                        Vec2::new(28.0, LINE_HEIGHT),
+                                    ),
+                                    egui::Button::new(">>").frame(false),
+                                )
+                                .on_hover_text("Revert this hunk")
+                                .clicked()
+                            {
+                                out.revert = Some(h);
+                            }
+                            if hunk.review {
+                                ui.painter().circle_filled(
+                                    Pos2::new(control_x + 60.0, y + 4.0),
+                                    3.0,
+                                    colors.warn,
+                                );
+                            }
+                        }
                     }
-                }
-                if response.has_focus() && ui.is_enabled() {
-                    let events = ui.input(|i| i.events.clone());
-                    let before = (cursor, text.clone());
-                    let mut history = state.undoer();
-                    if !is_old {
-                        history.feed_state(ui.input(|i| i.time), &before);
+                    for row in first..last {
+                        let (a, b) = g.rows.rows[row];
+                        let changed = g.rows.hunk_rows.iter().any(|r| r.contains(&row));
+                        for is_old in [true, false] {
+                            if options.unified && is_old && b.is_some() {
+                                continue;
+                            }
+                            let line = if is_old { a } else { b };
+                            let origin = if is_old { old_origin } else { new_origin };
+                            let pane = if is_old { g.old_width } else { g.new_width };
+                            let row_rect = Rect::from_min_size(
+                                origin + Vec2::new(0.0, g.offsets[row]),
+                                Vec2::new(pane, g.offsets[row + 1] - g.offsets[row]),
+                            );
+                            if changed && line.is_some() {
+                                ui.painter().rect_filled(
+                                    row_rect,
+                                    0.0,
+                                    if is_old { colors.del } else { colors.add },
+                                );
+                            }
+                            let Some(line) = line else { continue };
+                            ui.painter().text(
+                                origin + Vec2::new(37.0, g.offsets[row] + LINE_HEIGHT * 0.5),
+                                egui::Align2::RIGHT_CENTER,
+                                (line + 1).to_string(),
+                                FontId::monospace(FONT_SIZE),
+                                colors.muted,
+                            );
+                        }
                     }
-                    for event in events {
+                    // Input and selection use full-document character positions, independent of rendered rows.
+                    for is_old in [true, false] {
+                        if is_old && options.unified {
+                            continue;
+                        }
+                        let editor_id = if is_old { id.with("old-virtual") } else { id };
+                        let origin = if is_old { old_origin } else { new_origin };
+                        let pane = if is_old { g.old_width } else { g.new_width };
+                        let rect = Rect::from_min_size(
+                            origin + Vec2::new(TEXT_INSET, 0.0),
+                            Vec2::new(pane - TEXT_INSET - TEXT_PADDING, height),
+                        );
+                        let response = ui
+                            .interact(
+                                rect.intersect(ui.clip_rect()),
+                                editor_id,
+                                Sense::click_and_drag(),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::Text);
+                        if !is_old && response.hovered() && ui.is_enabled() {
+                            ui.output_mut(|o| o.mutable_text_under_cursor = true);
+                        }
+                        if response.has_focus() && ui.is_enabled() {
+                            ui.memory_mut(|m| {
+                                m.set_focus_lock_filter(
+                                    editor_id,
+                                    egui::EventFilter {
+                                        horizontal_arrows: true,
+                                        vertical_arrows: true,
+                                        tab: true,
+                                        ..Default::default()
+                                    },
+                                )
+                            });
+                        }
+                        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), editor_id)
+                            .unwrap_or_default();
+                        let mut cursor = state.cursor.char_range().unwrap_or_default();
                         let content = if is_old { old } else { text.as_str() };
-                        let length = content.chars().count();
-                        match event {
-                            egui::Event::Copy | egui::Event::Cut => {
-                                ui.ctx()
-                                    .copy_text(content[selected_bytes(content, cursor)].into());
-                                if !is_old && matches!(event, egui::Event::Cut) {
-                                    replace(text, &mut cursor, "");
-                                    follow = true;
-                                }
+                        let count = content.chars().count();
+                        cursor.primary.index = cursor.primary.index.min(count);
+                        cursor.secondary.index = cursor.secondary.index.min(count);
+                        let mut follow = false;
+                        let pressed = response.is_pointer_button_down_on()
+                            && ui.input(|i| i.pointer.any_pressed());
+                        if (pressed || response.clicked() || response.dragged())
+                            && let Some(pointer) = ui.input(|i| i.pointer.interact_pos())
+                        {
+                            response.request_focus();
+                            let pos = g.hit(
+                                ui,
+                                Pos2::new(pointer.x - rect.left(), pointer.y - origin.y),
+                                is_old,
+                            );
+                            let extend =
+                                (!pressed && response.dragged()) || ui.input(|i| i.modifiers.shift);
+                            move_to(&mut cursor, pos, extend);
+                            if response.double_clicked() {
+                                cursor = CCursorRange::two(
+                                    CCursor::new(word_left(content, pos)),
+                                    CCursor::new(word_right(content, pos)),
+                                );
                             }
-                            egui::Event::Text(insert) | egui::Event::Paste(insert) if !is_old => {
-                                replace(text, &mut cursor, &insert);
-                                follow = true;
+                            self.preferred_x = None;
+                            if response.dragged() {
+                                ui.scroll_to_rect(
+                                    Rect::from_min_size(pointer, Vec2::splat(2.0)),
+                                    None,
+                                );
                             }
-                            egui::Event::Ime(egui::ImeEvent::Disabled) => {
-                                self.preedit.clear();
+                        }
+                        if response.has_focus() && ui.is_enabled() {
+                            let events = ui.input(|i| i.events.clone());
+                            let before = (cursor, text.clone());
+                            let mut history = state.undoer();
+                            if !is_old {
+                                history.feed_state(ui.input(|i| i.time), &before);
                             }
-                            egui::Event::Ime(egui::ImeEvent::Preedit(value)) if !is_old => {
-                                self.preedit = value;
-                            }
-                            egui::Event::Ime(egui::ImeEvent::Commit(value)) if !is_old => {
-                                replace(text, &mut cursor, &value);
-                                self.preedit.clear();
-                                follow = true;
-                            }
-                            egui::Event::Key {
-                                key,
-                                pressed: true,
-                                modifiers,
-                                ..
-                            } => {
-                                let at = cursor.primary.index;
-                                let word = modifiers.alt || (modifiers.ctrl && !modifiers.mac_cmd);
-                                let (line, segment) = g.location(at, is_old);
-                                let (_, lines, _) = g.side(is_old);
-                                let boundary = &lines[line].segments[segment];
-                                let mut target = None;
-                                match key {
-                                    Key::A if modifiers.command => {
-                                        cursor = CCursorRange::two(
-                                            CCursor::new(0),
-                                            CCursor::new(length),
+                            for event in events {
+                                let content = if is_old { old } else { text.as_str() };
+                                let length = content.chars().count();
+                                match event {
+                                    egui::Event::Copy | egui::Event::Cut => {
+                                        ui.ctx().copy_text(
+                                            content[selected_bytes(content, cursor)].into(),
                                         );
-                                    }
-                                    Key::Z if modifiers.command && !is_old => {
-                                        let current = (cursor, text.clone());
-                                        let result = if modifiers.shift {
-                                            history.redo(&current)
-                                        } else {
-                                            history.undo(&current)
-                                        };
-                                        if let Some((c, value)) = result.cloned() {
-                                            *text = value;
-                                            cursor = c;
+                                        if !is_old && matches!(event, egui::Event::Cut) {
+                                            replace(text, &mut cursor, "");
                                             follow = true;
                                         }
                                     }
-                                    Key::ArrowLeft => {
-                                        target = Some(if !modifiers.shift && !cursor.is_empty() {
-                                            cursor.sorted_cursors()[0].index
-                                        } else if modifiers.mac_cmd {
-                                            boundary.chars.start
-                                        } else if word {
-                                            word_left(content, at)
-                                        } else {
-                                            at.saturating_sub(1)
-                                        });
+                                    egui::Event::Text(insert) | egui::Event::Paste(insert)
+                                        if !is_old =>
+                                    {
+                                        replace(text, &mut cursor, &insert);
+                                        follow = true;
                                     }
-                                    Key::ArrowRight => {
-                                        target = Some(if !modifiers.shift && !cursor.is_empty() {
-                                            cursor.sorted_cursors()[1].index
-                                        } else if modifiers.mac_cmd {
-                                            boundary.chars.end
-                                        } else if word {
-                                            word_right(content, at)
-                                        } else {
-                                            (at + 1).min(length)
-                                        });
+                                    egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                                        self.preedit.clear();
                                     }
-                                    Key::Home => {
-                                        target = Some(if modifiers.command {
-                                            0
-                                        } else {
-                                            boundary.chars.start
-                                        });
+                                    egui::Event::Ime(egui::ImeEvent::Preedit(value)) if !is_old => {
+                                        self.preedit = value;
                                     }
-                                    Key::End => {
-                                        target = Some(if modifiers.command {
-                                            length
-                                        } else {
-                                            boundary.chars.end
-                                        });
+                                    egui::Event::Ime(egui::ImeEvent::Commit(value)) if !is_old => {
+                                        replace(text, &mut cursor, &value);
+                                        self.preedit.clear();
+                                        follow = true;
                                     }
-                                    Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown => {
-                                        if modifiers.mac_cmd {
-                                            target =
-                                                Some(if key == Key::ArrowUp { 0 } else { length });
-                                        } else {
-                                            let x = *self.preferred_x.get_or_insert_with(|| {
-                                                g.position(ui, at, is_old).x
-                                            });
-                                            let page = if matches!(key, Key::PageUp | Key::PageDown)
-                                            {
-                                                (ui.clip_rect().height() / LINE_HEIGHT).max(1.0)
-                                                    as isize
-                                            } else {
-                                                1
-                                            };
-                                            target = Some(g.vertical(
-                                                ui,
-                                                at,
-                                                is_old,
-                                                if matches!(key, Key::ArrowUp | Key::PageUp) {
-                                                    -page
+                                    egui::Event::Key {
+                                        key,
+                                        pressed: true,
+                                        modifiers,
+                                        ..
+                                    } => {
+                                        let at = cursor.primary.index;
+                                        let word =
+                                            modifiers.alt || (modifiers.ctrl && !modifiers.mac_cmd);
+                                        let (line, segment) = g.location(at, is_old);
+                                        let (_, lines, _) = g.side(is_old);
+                                        let boundary = &lines[line].segments[segment];
+                                        let mut target = None;
+                                        match key {
+                                            Key::A if modifiers.command => {
+                                                cursor = CCursorRange::two(
+                                                    CCursor::new(0),
+                                                    CCursor::new(length),
+                                                );
+                                            }
+                                            Key::Z if modifiers.command && !is_old => {
+                                                let current = (cursor, text.clone());
+                                                let result = if modifiers.shift {
+                                                    history.redo(&current)
                                                 } else {
-                                                    page
-                                                },
-                                                x,
-                                            ));
-                                        }
-                                    }
-                                    Key::Backspace | Key::Delete if !is_old => {
-                                        if cursor.is_empty() {
-                                            cursor.secondary.index = if key == Key::Backspace {
-                                                if word {
-                                                    word_left(content, at)
-                                                } else {
-                                                    at.saturating_sub(1)
+                                                    history.undo(&current)
+                                                };
+                                                if let Some((c, value)) = result.cloned() {
+                                                    *text = value;
+                                                    cursor = c;
+                                                    follow = true;
                                                 }
-                                            } else if word {
-                                                word_right(content, at)
-                                            } else {
-                                                (at + 1).min(length)
-                                            };
+                                            }
+                                            Key::ArrowLeft => {
+                                                target = Some(
+                                                    if !modifiers.shift && !cursor.is_empty() {
+                                                        cursor.sorted_cursors()[0].index
+                                                    } else if modifiers.mac_cmd {
+                                                        boundary.chars.start
+                                                    } else if word {
+                                                        word_left(content, at)
+                                                    } else {
+                                                        at.saturating_sub(1)
+                                                    },
+                                                );
+                                            }
+                                            Key::ArrowRight => {
+                                                target = Some(
+                                                    if !modifiers.shift && !cursor.is_empty() {
+                                                        cursor.sorted_cursors()[1].index
+                                                    } else if modifiers.mac_cmd {
+                                                        boundary.chars.end
+                                                    } else if word {
+                                                        word_right(content, at)
+                                                    } else {
+                                                        (at + 1).min(length)
+                                                    },
+                                                );
+                                            }
+                                            Key::Home => {
+                                                target = Some(if modifiers.command {
+                                                    0
+                                                } else {
+                                                    boundary.chars.start
+                                                });
+                                            }
+                                            Key::End => {
+                                                target = Some(if modifiers.command {
+                                                    length
+                                                } else {
+                                                    boundary.chars.end
+                                                });
+                                            }
+                                            Key::ArrowUp
+                                            | Key::ArrowDown
+                                            | Key::PageUp
+                                            | Key::PageDown => {
+                                                if modifiers.mac_cmd {
+                                                    target = Some(if key == Key::ArrowUp {
+                                                        0
+                                                    } else {
+                                                        length
+                                                    });
+                                                } else {
+                                                    let x = *self.preferred_x.get_or_insert_with(
+                                                        || g.position(ui, at, is_old).x,
+                                                    );
+                                                    let page = if matches!(
+                                                        key,
+                                                        Key::PageUp | Key::PageDown
+                                                    ) {
+                                                        (ui.clip_rect().height() / LINE_HEIGHT)
+                                                            .max(1.0)
+                                                            as isize
+                                                    } else {
+                                                        1
+                                                    };
+                                                    target = Some(g.vertical(
+                                                        ui,
+                                                        at,
+                                                        is_old,
+                                                        if matches!(key, Key::ArrowUp | Key::PageUp)
+                                                        {
+                                                            -page
+                                                        } else {
+                                                            page
+                                                        },
+                                                        x,
+                                                    ));
+                                                }
+                                            }
+                                            Key::Backspace | Key::Delete if !is_old => {
+                                                if cursor.is_empty() {
+                                                    cursor.secondary.index =
+                                                        if key == Key::Backspace {
+                                                            if word {
+                                                                word_left(content, at)
+                                                            } else {
+                                                                at.saturating_sub(1)
+                                                            }
+                                                        } else if word {
+                                                            word_right(content, at)
+                                                        } else {
+                                                            (at + 1).min(length)
+                                                        };
+                                                }
+                                                replace(text, &mut cursor, "");
+                                                follow = true;
+                                            }
+                                            Key::Enter if !is_old && !modifiers.command => {
+                                                replace(text, &mut cursor, "\n");
+                                                follow = true;
+                                            }
+                                            Key::Tab if !is_old && !modifiers.shift => {
+                                                replace(text, &mut cursor, "\t");
+                                                follow = true;
+                                            }
+                                            _ => {}
                                         }
-                                        replace(text, &mut cursor, "");
-                                        follow = true;
-                                    }
-                                    Key::Enter if !is_old && !modifiers.command => {
-                                        replace(text, &mut cursor, "\n");
-                                        follow = true;
-                                    }
-                                    Key::Tab if !is_old && !modifiers.shift => {
-                                        replace(text, &mut cursor, "\t");
-                                        follow = true;
+                                        if let Some(target) = target {
+                                            move_to(&mut cursor, target, modifiers.shift);
+                                            follow = true;
+                                            if !matches!(
+                                                key,
+                                                Key::ArrowUp
+                                                    | Key::ArrowDown
+                                                    | Key::PageUp
+                                                    | Key::PageDown
+                                            ) {
+                                                self.preferred_x = None;
+                                            }
+                                        }
                                     }
                                     _ => {}
                                 }
-                                if let Some(target) = target {
-                                    move_to(&mut cursor, target, modifiers.shift);
-                                    follow = true;
-                                    if !matches!(
-                                        key,
-                                        Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown
-                                    ) {
-                                        self.preferred_x = None;
-                                    }
-                                }
                             }
-                            _ => {}
+                            if !is_old && *text != before.1 {
+                                self.preferred_x = None;
+                                out.changed = true;
+                                self.follow_cursor = true;
+                                ui.ctx().request_repaint();
+                            }
+                            if !is_old {
+                                history.feed_state(ui.input(|i| i.time), &(cursor, text.clone()));
+                            }
+                            state.set_undoer(history);
                         }
-                    }
-                    if !is_old && *text != before.1 {
-                        self.preferred_x = None;
-                        out.changed = true;
-                        self.follow_cursor = true;
-                        ui.ctx().request_repaint();
-                    }
-                    if !is_old {
-                        history.feed_state(ui.input(|i| i.time), &(cursor, text.clone()));
-                    }
-                    state.set_undoer(history);
-                }
-                let [start, end] = cursor.sorted_cursors();
-                let (_, lines, map) = g.side(is_old);
-                for row in first..last {
-                    let line = if is_old {
-                        g.rows.rows[row].0
-                    } else {
-                        g.rows.rows[row].1
-                    };
-                    let Some(line) = line else { continue };
-                    for (i, segment) in lines[line].segments.iter().enumerate() {
-                        let y = origin.y + g.offsets[map[line]] + i as f32 * LINE_HEIGHT;
-                        if y + LINE_HEIGHT < ui.clip_rect().top() || y > ui.clip_rect().bottom() {
-                            continue;
-                        }
-                        if start.index < segment.chars.end && end.index > segment.chars.start {
-                            let left = g
-                                .position(ui, start.index.max(segment.chars.start), is_old)
-                                .x;
-                            let right = if end.index >= segment.chars.end {
-                                segment.width
+                        let [start, end] = cursor.sorted_cursors();
+                        let (_, lines, map) = g.side(is_old);
+                        for row in first..last {
+                            let line = if is_old {
+                                g.rows.rows[row].0
                             } else {
-                                g.position(ui, end.index, is_old).x
+                                g.rows.rows[row].1
                             };
-                            ui.painter().rect_filled(
-                                Rect::from_min_size(
-                                    Pos2::new(rect.left() + left, y),
-                                    Vec2::new((right - left).max(2.0), LINE_HEIGHT),
-                                ),
-                                0.0,
-                                ui.visuals().selection.bg_fill,
-                            );
-                        }
-                    }
-                }
-                if response.has_focus() && ui.is_enabled() {
-                    let pos = g.position(ui, cursor.primary.index, is_old);
-                    let caret = Rect::from_min_size(
-                        Pos2::new(rect.left() + pos.x, origin.y + pos.y),
-                        Vec2::new(1.0, LINE_HEIGHT),
-                    );
-                    if !out.changed && (follow || self.follow_cursor) {
-                        ui.scroll_to_rect(caret.expand(8.0), None);
-                        self.follow_cursor = false;
-                    }
-                    ui.painter().vline(
-                        caret.left(),
-                        caret.y_range(),
-                        Stroke::new(1.0_f32, colors.accent),
-                    );
-                    if !is_old {
-                        ui.output_mut(|o| {
-                            o.ime = Some(egui::output::IMEOutput {
-                                rect,
-                                cursor_rect: caret,
-                            })
-                        });
-                        if !self.preedit.is_empty() {
-                            ui.painter().text(
-                                caret.left_top(),
-                                egui::Align2::LEFT_TOP,
-                                &self.preedit,
-                                FontId::monospace(FONT_SIZE),
-                                colors.accent,
-                            );
-                        }
-                    }
-                }
-                state.cursor.set_char_range(Some(cursor));
-                state.store(ui.ctx(), editor_id);
-            }
-            // Glyph meshes are allocated only for visible visual segments.
-            for row in first..last {
-                let (a, b) = g.rows.rows[row];
-                for (is_old, line) in [(true, a), (false, b)] {
-                    if options.unified && is_old && b.is_some() {
-                        continue;
-                    }
-                    let Some(line) = line else { continue };
-                    let (text, lines, _) = g.side(is_old);
-                    let origin = if is_old { old_origin } else { new_origin };
-                    let pane = if is_old { g.old_width } else { g.new_width };
-                    let clip = ui.clip_rect().intersect(Rect::from_min_size(
-                        origin + Vec2::new(TEXT_INSET, 0.0),
-                        Vec2::new(pane - TEXT_INSET - TEXT_PADDING, height),
-                    ));
-                    for (i, s) in lines[line].segments.iter().enumerate() {
-                        let y = origin.y + g.offsets[row] + i as f32 * LINE_HEIGHT;
-                        if y + LINE_HEIGHT < clip.top() || y > clip.bottom() {
-                            continue;
-                        }
-                        let mut bytes = s.bytes.clone();
-                        let mut x = 0.0;
-                        // Also bound meshes for a single very long unwrapped line.
-                        ui.fonts_mut(|fonts| {
-                            let mut started = false;
-                            let mut right = 0.0;
-                            bytes.end = bytes.start;
-                            for (b, c) in text[s.bytes.clone()].char_indices() {
-                                let w = advance(fonts, c);
-                                if !started
-                                    && origin.x + TEXT_INSET + right + w >= clip.left() - 64.0
+                            let Some(line) = line else { continue };
+                            for (i, segment) in lines[line].segments.iter().enumerate() {
+                                let y = origin.y + g.offsets[map[line]] + i as f32 * LINE_HEIGHT;
+                                if y + LINE_HEIGHT < ui.clip_rect().top()
+                                    || y > ui.clip_rect().bottom()
                                 {
-                                    bytes.start = s.bytes.start + b;
-                                    x = right;
-                                    started = true;
+                                    continue;
                                 }
-                                right += w;
-                                if started {
-                                    bytes.end = s.bytes.start + b + c.len_utf8();
-                                }
-                                if started && origin.x + TEXT_INSET + right > clip.right() + 64.0 {
-                                    break;
+                                if start.index < segment.chars.end
+                                    && end.index > segment.chars.start
+                                {
+                                    let left = g
+                                        .position(ui, start.index.max(segment.chars.start), is_old)
+                                        .x;
+                                    let right = if end.index >= segment.chars.end {
+                                        segment.width
+                                    } else {
+                                        g.position(ui, end.index, is_old).x
+                                    };
+                                    ui.painter().rect_filled(
+                                        Rect::from_min_size(
+                                            Pos2::new(rect.left() + left, y),
+                                            Vec2::new((right - left).max(2.0), LINE_HEIGHT),
+                                        ),
+                                        0.0,
+                                        ui.visuals().selection.bg_fill,
+                                    );
                                 }
                             }
-                        });
-                        let doc = if is_old { &old_doc } else { &new_doc };
-                        let galley = ui.fonts_mut(|f| f.layout_job(doc.job(bytes)));
-                        let ppp = ui.ctx().pixels_per_point();
-                        let pos = Pos2::new(
-                            ((origin.x + TEXT_INSET + x) * ppp).round() / ppp,
-                            ((y + (LINE_HEIGHT - galley.size().y) * 0.5) * ppp).round() / ppp,
-                        );
-                        ui.painter()
-                            .with_clip_rect(clip)
-                            .galley(pos, galley, Color32::WHITE);
+                        }
+                        if response.has_focus() && ui.is_enabled() {
+                            let pos = g.position(ui, cursor.primary.index, is_old);
+                            let caret = Rect::from_min_size(
+                                Pos2::new(rect.left() + pos.x, origin.y + pos.y),
+                                Vec2::new(1.0, LINE_HEIGHT),
+                            );
+                            if !out.changed && (follow || self.follow_cursor) {
+                                ui.scroll_to_rect(caret.expand(8.0), None);
+                                self.follow_cursor = false;
+                            }
+                            ui.painter().vline(
+                                caret.left(),
+                                caret.y_range(),
+                                Stroke::new(1.0_f32, colors.accent),
+                            );
+                            if !is_old {
+                                ui.output_mut(|o| {
+                                    o.ime = Some(egui::output::IMEOutput {
+                                        rect,
+                                        cursor_rect: caret,
+                                    })
+                                });
+                                if !self.preedit.is_empty() {
+                                    ui.painter().text(
+                                        caret.left_top(),
+                                        egui::Align2::LEFT_TOP,
+                                        &self.preedit,
+                                        FontId::monospace(FONT_SIZE),
+                                        colors.accent,
+                                    );
+                                }
+                            }
+                        }
+                        state.cursor.set_char_range(Some(cursor));
+                        state.store(ui.ctx(), editor_id);
                     }
-                }
-            }
-        });
+                    // Glyph meshes are allocated only for visible visual segments.
+                    for row in first..last {
+                        let (a, b) = g.rows.rows[row];
+                        for (is_old, line) in [(true, a), (false, b)] {
+                            if options.unified && is_old && b.is_some() {
+                                continue;
+                            }
+                            let Some(line) = line else { continue };
+                            let (text, lines, _) = g.side(is_old);
+                            let origin = if is_old { old_origin } else { new_origin };
+                            let pane = if is_old { g.old_width } else { g.new_width };
+                            let clip = ui.clip_rect().intersect(Rect::from_min_size(
+                                origin + Vec2::new(TEXT_INSET, 0.0),
+                                Vec2::new(pane - TEXT_INSET - TEXT_PADDING, height),
+                            ));
+                            for (i, s) in lines[line].segments.iter().enumerate() {
+                                let y = origin.y + g.offsets[row] + i as f32 * LINE_HEIGHT;
+                                if y + LINE_HEIGHT < clip.top() || y > clip.bottom() {
+                                    continue;
+                                }
+                                let mut bytes = s.bytes.clone();
+                                let mut x = 0.0;
+                                // Also bound meshes for a single very long unwrapped line.
+                                ui.fonts_mut(|fonts| {
+                                    let mut started = false;
+                                    let mut right = 0.0;
+                                    bytes.end = bytes.start;
+                                    for (b, c) in text[s.bytes.clone()].char_indices() {
+                                        let w = advance(fonts, c);
+                                        if !started
+                                            && origin.x + TEXT_INSET + right + w
+                                                >= clip.left() - 64.0
+                                        {
+                                            bytes.start = s.bytes.start + b;
+                                            x = right;
+                                            started = true;
+                                        }
+                                        right += w;
+                                        if started {
+                                            bytes.end = s.bytes.start + b + c.len_utf8();
+                                        }
+                                        if started
+                                            && origin.x + TEXT_INSET + right > clip.right() + 64.0
+                                        {
+                                            break;
+                                        }
+                                    }
+                                });
+                                let doc = if is_old { &old_doc } else { &new_doc };
+                                let galley = ui.fonts_mut(|f| f.layout_job(doc.job(bytes)));
+                                let ppp = ui.ctx().pixels_per_point();
+                                let pos = Pos2::new(
+                                    ((origin.x + TEXT_INSET + x) * ppp).round() / ppp,
+                                    ((y + (LINE_HEIGHT - galley.size().y) * 0.5) * ppp).round()
+                                        / ppp,
+                                );
+                                ui.painter().with_clip_rect(clip).galley(
+                                    pos,
+                                    galley,
+                                    Color32::WHITE,
+                                );
+                            }
+                        }
+                    }
+                })
+            })
+            .inner;
+        out.jump = crate::diff_navigation::overview(
+            ui,
+            id.with("change-map"),
+            rail,
+            hunks,
+            &g.rows.hunk_rows,
+            &g.offsets,
+            output.content_size.y,
+            output.state.offset.y..output.state.offset.y + output.inner_rect.height(),
+        );
+        if out.jump.is_some() {
+            self.follow_cursor = false;
+            ui.ctx().request_repaint();
+        }
         out
     }
 }

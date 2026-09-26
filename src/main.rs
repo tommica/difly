@@ -1,3 +1,4 @@
+mod diff_navigation;
 mod diff_view;
 mod file_tree;
 mod icon;

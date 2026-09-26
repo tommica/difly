@@ -366,7 +366,7 @@ pub struct App {
     source_tab: usize,
     saved: bool,
     jump_hunk: Option<usize>,
-    hunk_cursor: usize,
+    hunk_cursor: Option<usize>,
     confirm_close: bool,
     dark: bool,
 }
@@ -413,7 +413,7 @@ impl App {
             source_tab: 1,
             saved: true,
             jump_hunk: None,
-            hunk_cursor: 0,
+            hunk_cursor: None,
             confirm_close: false,
             dark,
         };
@@ -550,7 +550,8 @@ impl App {
             }
         }
         self.active = Some(path.clone());
-        self.hunk_cursor = 0;
+        self.hunk_cursor = None;
+        self.jump_hunk = None;
         if let Some(i) = self.index() {
             if let Some(repo) = &self.repo
                 && let Err(error) = repo.load_preview(&mut self.files[i])
@@ -1151,6 +1152,15 @@ impl App {
         let editor_id = egui::Id::new(("working", &file.path));
         let mut history_action = None;
         let hs = model::hunks(&old, &self.draft);
+        if ui.is_enabled()
+            && !self.open
+            && !self.confirm_revert
+            && !self.confirm_close
+            && let Some(backwards) = crate::diff_navigation::shortcut(ui.ctx())
+        {
+            self.hunk_cursor = crate::diff_navigation::next(self.hunk_cursor, hs.len(), backwards);
+            self.jump_hunk = self.hunk_cursor;
+        }
         ui.horizontal(|ui| {
             let state =
                 egui::text_edit::TextEditState::load(ui.ctx(), editor_id).unwrap_or_default();
@@ -1177,13 +1187,27 @@ impl App {
                     .small()
                     .color(colors.muted),
             );
-            if ui.small_button("Previous").clicked() && !hs.is_empty() {
-                self.hunk_cursor = self.hunk_cursor.saturating_sub(1);
-                self.jump_hunk = Some(self.hunk_cursor);
+            if ui
+                .add_enabled(
+                    !hs.is_empty(),
+                    egui::Button::new("↑ Previous diff · Shift+F7").small(),
+                )
+                .on_hover_text("Previous hunk (Shift+F7)")
+                .clicked()
+            {
+                self.hunk_cursor = crate::diff_navigation::next(self.hunk_cursor, hs.len(), true);
+                self.jump_hunk = self.hunk_cursor;
             }
-            if ui.small_button("Next").clicked() && !hs.is_empty() {
-                self.hunk_cursor = (self.hunk_cursor + 1).min(hs.len() - 1);
-                self.jump_hunk = Some(self.hunk_cursor);
+            if ui
+                .add_enabled(
+                    !hs.is_empty(),
+                    egui::Button::new("↓ Next diff · F7").small(),
+                )
+                .on_hover_text("Next hunk (F7)")
+                .clicked()
+            {
+                self.hunk_cursor = crate::diff_navigation::next(self.hunk_cursor, hs.len(), false);
+                self.jump_hunk = self.hunk_cursor;
             }
             if ui.small_button("Include all").clicked() {
                 self.files[i].select(true);
@@ -1237,6 +1261,11 @@ impl App {
                 },
                 jump,
             );
+            if let Some(h) = outcome.jump {
+                self.hunk_cursor = Some(h);
+                self.jump_hunk = Some(h);
+                ui.ctx().request_repaint();
+            }
             if let Some(split) = outcome.split {
                 self.split_ratio = split;
             }
@@ -1260,6 +1289,8 @@ impl App {
             return;
         }
         egui::Frame::new().fill(colors.bg).show(ui, |ui| {
+            let (content, rail) = crate::diff_navigation::areas(ui.available_rect_before_wrap());
+            ui.set_max_width(content.width());
             let viewport_width = ui.available_width();
             let view = DiffLayout::build(
                 ui,
@@ -1281,7 +1312,7 @@ impl App {
             if let Some(h) = jump.and_then(|h| view.rows.hunk_rows.get(h)) {
                 scroll = scroll.vertical_scroll_offset(view.offsets[h.start]);
             }
-            scroll.show(ui, |ui| {
+            let output = scroll.show(ui, |ui| {
                 let ppp = ui.ctx().pixels_per_point();
                 let cursor = ui.cursor().min;
                 let origin = Pos2::new(
@@ -1518,6 +1549,20 @@ impl App {
                     },
                 );
             });
+            if let Some(h) = crate::diff_navigation::overview(
+                ui,
+                editor_id.with("change-map"),
+                rail,
+                &self.files[i].hunks,
+                &view.rows.hunk_rows,
+                &view.offsets,
+                output.content_size.y,
+                output.state.offset.y..output.state.offset.y + output.inner_rect.height(),
+            ) {
+                self.hunk_cursor = Some(h);
+                self.jump_hunk = Some(h);
+                ui.ctx().request_repaint();
+            }
         });
         if let Some(redo) = history_action
             && let Some(text) = edit_history(ui.ctx(), editor_id, &self.draft, redo)
