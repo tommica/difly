@@ -52,4 +52,4 @@ Binary files are whole-file changes. Submodules and very large files are outside
 
 ## License
 
-[BSD 3-Clause](LICENSE). Bundled JetBrains Mono uses the [SIL Open Font License](assets/fonts/OFL.txt).
+[BSD 3-Clause](LICENSE). Code views use bundled Comic Mono (regular and bold), under its [MIT license](assets/fonts/ComicMono-LICENSE.txt). The supplied font files identify as Comic Mono.

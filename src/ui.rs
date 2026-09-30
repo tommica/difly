@@ -84,15 +84,22 @@ impl Colors {
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "JetBrains Mono".into(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"))
-            .into(),
+        "Comic Mono".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/ComicMono.ttf")).into(),
     );
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .insert(0, "JetBrains Mono".into());
+        .insert(0, "Comic Mono".into());
+    fonts.font_data.insert(
+        "Comic Mono Bold".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/ComicMono-Bold.ttf")).into(),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("Comic Mono Bold".into()),
+        vec!["Comic Mono Bold".into()],
+    );
     ctx.set_fonts(fonts);
 }
 fn apply_theme(ctx: &egui::Context, dark: bool) {

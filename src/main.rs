@@ -32,9 +32,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Difly",
         options,
-        Box::new(move |cc| {
-            icon::set_application_icon();
-            Ok(Box::new(ui::App::new(cc, path)))
-        }),
+        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, path)))),
     )
 }

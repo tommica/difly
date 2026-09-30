@@ -15,11 +15,6 @@ tempfile = "3"
 [build-dependencies]
 resvg = { version = "0.45", default-features = false }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
-
 [dev-dependencies]
 
 [profile.release]
