@@ -1,55 +1,61 @@
 # Difly
 
-A standalone Git commit dialog built in Rust with egui. Review and edit diffs, select hunks, commit or amend, and resolve merge conflicts.
+A standalone Git commit dialog built in Rust with GPUI. Review editable diffs, select hunks,
+commit or amend, and resolve merge conflicts.
 
-![Difly showing an editable side-by-side Git diff](docs/images/difly.png)
+![Difly](docs/images/difly.png)
 
 ## Install and run
 
-With Homebrew (macOS/Linux):
-
 ```sh
-brew install tommica/tap/difly
-difly /path/to/repository        # omit the path for the current repository
+brew install tommica/tap/difly       # latest tagged release
+brew update && brew upgrade difly
+
+difly /path/to/repository            # omit the path for the current repository
 ```
 
-Update with `brew update && brew upgrade difly`.
-
-Or build from source with Rust/Cargo and Git:
+Build this checkout (the GPUI version) with a recent Rust toolchain and Git:
 
 ```sh
-cargo install --path .
+cargo install --locked --path .
 difly
 ```
 
-Git needs an author configured before committing.
-
-Targets macOS, Linux, and Windows. Tested locally on macOS; CI covers all three.
+Git needs an author configured. macOS is tested locally; CI builds macOS, Linux and Windows.
+The Homebrew release changes when a new version is published, not when this checkout changes.
 
 ## Controls
 
-- Use **↑/↓** to navigate the tree, **Space** to toggle inclusion, **←** to collapse/go to the parent, and **→** to expand/go to the next row. **Home/End** jump to the first/last row.
-- Toggle **Group by folder** for a tree or flat list of paths.
-- Switch between **side-by-side/unified**, **soft wrap**, and **light/dark** themes (theme choice is remembered).
-- Drag the center gutter to resize panes; double-click to reset.
-- Check hunks to include them. **`>>`** reverts a hunk; **Undo revert** restores it.
-- **Ctrl/Cmd+Z** undoes edits; **Ctrl/Cmd+R** redoes. Edits autosave.
-- **Amend** lets you choose a recent commit and edit its message. Older commits replay newer history; conflicts leave the original branch unchanged. Linear history only.
-- **Ctrl/Cmd+Enter** commits. **Ctrl/Cmd+O** opens another repository.
+- Use arrows in the file tree and **Space** to toggle inclusion. Partial files/folders show **−**.
+- Filter files or toggle **Group by folder**. Drag the dividers to resize panes.
+- Use **F7 / Shift+F7** for the next/previous hunk. Check hunks to include them; **`>>`** reverts.
+- Edits autosave. **Ctrl/Cmd+Z** undoes edits; **Ctrl/Cmd+R** redoes. **Undo revert** restores a revert.
+- **Amend** chooses a recent commit; disabling it restores the original message draft.
+- **Ctrl/Cmd+Enter** commits; **Ctrl/Cmd+O** opens another repository.
+- Switch light/dark themes or soft wrap. Preferences and message drafts are saved in the system
+  user configuration directory (`settings.json`; override with `DIFLY_CONFIG_DIR`).
 
-Tracked changes start checked; unversioned files start unchecked. Editing preserves selection. After committing, remaining changes stay on disk, unstaged. Merge commits require all conflicts resolved and all tracked changes included.
+Tracked changes start included; unversioned files start excluded. Remaining changes stay
+unstaged after committing. During a merge, resolve conflicts and include all tracked changes.
 
-## Demo and development
+Side-by-side supports editing; **Unified review** is read-only. The editable panes currently
+use linked scroll offsets and do not insert blank rows to align unequal changes. Binary files
+are whole-file changes. Finish rebases/cherry-picks through Git. Older-commit amend supports
+linear history; conflicts leave the original branch unchanged.
+
+## Development
 
 ```sh
-bash scripts/create-demo.sh       # requires a new demo-files directory
+bash scripts/create-demo.sh         # requires a new demo-files directory
 cargo run -- demo-files
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo test --locked --all-targets
+# Optional native-window integration test (requires a graphical session):
+cargo test --locked --features ui-tests --test ui_workflow
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Binary files are whole-file changes. Submodules and very large files are outside the current scope. Finish rebases/cherry-picks through Git.
+[Packaging notes](packaging/README.md).
 
 ## License
 
-[BSD 3-Clause](LICENSE). Code views use bundled Comic Mono (regular and bold), under its [MIT license](assets/fonts/ComicMono-LICENSE.txt). The supplied font files identify as Comic Mono.
+[BSD 3-Clause](LICENSE). Comic Mono uses its bundled [MIT license](assets/fonts/ComicMono-LICENSE.txt).

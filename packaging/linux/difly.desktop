@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Difly
+Comment=Review and commit Git changes
+Exec=difly %f
+Icon=difly
+Terminal=false
+Categories=Development;RevisionControl;
+StartupWMClass=difly

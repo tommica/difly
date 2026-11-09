@@ -28,6 +28,8 @@ impl CommitInfo {
 pub struct FileSource {
     pub oid: Option<String>,
     pub old_size: u64,
+    /// HEAD-to-working-tree counts without retaining unopened file contents.
+    pub line_changes: Option<(usize, usize)>,
     pub work: WorkStamp,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +59,17 @@ pub struct File {
     pub source: Option<FileSource>,
 }
 impl File {
+    pub fn line_changes(&self) -> Option<(usize, usize)> {
+        if self.binary {
+            return None;
+        }
+        if self.loaded || self.source.is_none() {
+            return Some(self.hunks.iter().fold((0, 0), |(added, removed), h| {
+                (added + h.new.len(), removed + h.old.len())
+            }));
+        }
+        self.source.as_ref().and_then(|s| s.line_changes)
+    }
     pub fn sizes(&self) -> (u64, u64) {
         if self.loaded {
             (self.old.len() as u64, self.current.len() as u64)
@@ -68,7 +81,9 @@ impl File {
         }
     }
     pub fn unload(&mut self) {
-        if self.source.is_some() {
+        let line_changes = self.line_changes();
+        if let Some(source) = &mut self.source {
+            source.line_changes = line_changes;
             self.old = Vec::new();
             self.current = Vec::new();
             for h in &mut self.hunks {
@@ -415,13 +430,28 @@ impl Repo {
             );
         }
         let changed = if self.head().is_some() {
-            Some(
-                self.git(&["diff", "--name-only", "-z", "HEAD", "--"])?
-                    .split(|&b| b == 0)
-                    .filter(|p| !p.is_empty())
-                    .map(bytes_path)
-                    .collect::<std::collections::HashSet<_>>(),
-            )
+            let data = self.git(&[
+                "diff",
+                "--numstat",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "HEAD",
+                "--",
+            ])?;
+            let mut changes = std::collections::HashMap::new();
+            for record in data.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+                // Split only the count columns: a Git path can itself contain tabs/newlines.
+                let mut fields = record.splitn(3, |&b| b == b'\t');
+                if let (Some(added), Some(removed), Some(path)) =
+                    (fields.next(), fields.next(), fields.next())
+                {
+                    let count = |bytes| std::str::from_utf8(bytes).ok()?.parse::<usize>().ok();
+                    changes.insert(bytes_path(path), count(added).zip(count(removed)));
+                }
+            }
+            Some(changes)
         } else {
             None
         };
@@ -433,7 +463,9 @@ impl Repo {
                 && !code.contains(&b'U')
                 && code != b"AA"
                 && code != b"DD"
-                && changed.as_ref().is_some_and(|paths| !paths.contains(&path))
+                && changed
+                    .as_ref()
+                    .is_some_and(|paths| !paths.contains_key(&path))
             {
                 continue;
             }
@@ -451,6 +483,9 @@ impl Repo {
             let mode = work_mode(&full, &old_mode);
             let tracked = code != b"??";
             let conflict = code.contains(&b'U') || code == b"AA" || code == b"DD";
+            let line_changes = changed
+                .as_ref()
+                .and_then(|c| c.get(&path).copied().flatten());
             files.push(File {
                 path,
                 old: vec![],
@@ -468,6 +503,7 @@ impl Repo {
                 source: Some(FileSource {
                     oid: entry.map(|e| e.1.clone()),
                     old_size: entry.map(|e| e.2).unwrap_or(0),
+                    line_changes,
                     work,
                 }),
             });

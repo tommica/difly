@@ -801,3 +801,69 @@ fn lazy_merge_resolution_and_commit_preserve_two_parents() {
     );
     assert_eq!(r.blob("HEAD:file.txt").unwrap(), b"resolved\n");
 }
+
+#[test]
+fn tree_counts_ignore_staging_and_survive_editing_and_unloading() {
+    let (_temp, r) = repo();
+    seed(&r);
+    fs::write(
+        r.root.join("file.txt"),
+        "ONE\ntwo\nthree\nfour\nfive\nextra\n",
+    )
+    .unwrap();
+    git(&r.root, &["add", "file.txt"]);
+    fs::write(
+        r.root.join("file.txt"),
+        "ONE\ntwo\nthree\nfour\nfive\nextra\nanother\n",
+    )
+    .unwrap();
+    let mut file = r.scan_metadata().unwrap().remove(0);
+    assert!(!file.loaded && file.current.is_empty());
+    assert_eq!(file.line_changes(), Some((3, 1)));
+    r.load_file(&mut file).unwrap();
+    assert_eq!(file.line_changes(), Some((3, 1)));
+    r.save(&mut file, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    file.unload();
+    assert_eq!(file.line_changes(), Some((0, 0)));
+}
+
+#[test]
+fn tree_metadata_distinguishes_new_deleted_binary_and_unversioned_files() {
+    let (_temp, r) = repo();
+    seed(&r);
+    fs::remove_file(r.root.join("file.txt")).unwrap();
+    fs::write(r.root.join("new.txt"), "new\n").unwrap();
+    fs::write(r.root.join("binary.bin"), b"\0binary").unwrap();
+    git(&r.root, &["add", "new.txt", "binary.bin"]);
+    fs::write(r.root.join("unversioned.txt"), "untracked\n").unwrap();
+    let files = r.scan_metadata().unwrap();
+    let find = |name: &str| files.iter().find(|f| f.path == Path::new(name)).unwrap();
+    let deleted = find("file.txt");
+    assert!(deleted.base_exists && !deleted.exists);
+    assert_eq!(deleted.line_changes(), Some((0, 5)));
+    let new = find("new.txt");
+    assert!(!new.base_exists && new.exists && new.tracked);
+    assert_eq!(new.line_changes(), Some((1, 0)));
+    assert_eq!(find("binary.bin").line_changes(), None);
+    let mut unversioned = find("unversioned.txt").clone();
+    assert!(!unversioned.base_exists && !unversioned.tracked);
+    r.load_preview(&mut unversioned).unwrap();
+    assert_eq!(unversioned.line_changes(), Some((1, 0)));
+    unversioned.unload();
+    assert_eq!(unversioned.line_changes(), Some((1, 0)));
+}
+
+#[cfg(unix)]
+#[test]
+fn tree_numstat_preserves_tabs_and_newlines_in_paths() {
+    let (_temp, r) = repo();
+    let path = "tab\tand\nnewline.txt";
+    fs::write(r.root.join(path), "before\n").unwrap();
+    git(&r.root, &["add", "."]);
+    git(&r.root, &["commit", "-m", "initial"]);
+    fs::write(r.root.join(path), "after\nextra").unwrap();
+    let files = r.scan_metadata().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, Path::new(path));
+    assert_eq!(files[0].line_changes(), Some((2, 1)));
+}
